@@ -1,0 +1,360 @@
+-- access_control.lua
+
+-------------------------------------------------------------------------------
+-- START LOGGING
+-------------------------------------------------------------------------------
+ngx.log(ngx.ERR, "=== LUA START ===")
+
+-------------------------------------------------------------------------------
+-- Подключаем модули
+-------------------------------------------------------------------------------
+local redis_lib = require "resty.redis"
+local cjson     = require "cjson.safe"
+local http_lib  = require "resty.http"
+
+-------------------------------------------------------------------------------
+-- Инициализируем генератор случайных чисел для ID
+-------------------------------------------------------------------------------
+math.randomseed(ngx.time())
+
+-------------------------------------------------------------------------------
+-- Функция безопасного логирования
+-------------------------------------------------------------------------------
+local function safe_log(msg)
+  ngx.log(ngx.ERR, "[access_control] ", msg)
+end
+safe_log("Started")
+
+-------------------------------------------------------------------------------
+-- Константы Redis (для логирования и контроля)
+-------------------------------------------------------------------------------
+local REDIS_HOST    = "${REDIS_HOST}"
+local REDIS_PORT_NUM    = ${REDIS_PORT}
+local REDIS_TIMEOUT = 1000  -- миллисекунд
+
+-------------------------------------------------------------------------------
+-- Константы ClickHouse
+-------------------------------------------------------------------------------
+local CH_HOST       = "${CLICKHOUSE_HOST}"
+local CH_PORT_NUM       = ${CLICKHOUSE_PORT}
+local CH_USER       = "${CLICKHOUSE_USER}"
+local CH_PASSWORD   = "${CLICKHOUSE_PASSWORD}"
+local CH_DATABASE   = "${CLICKHOUSE_DATABASE}"
+local CH_TABLE      = "${CLICKHOUSE_TABLE}"
+
+-------------------------------------------------------------------------------
+-- Параметры пакетной отправки в ClickHouse
+-------------------------------------------------------------------------------
+local BATCH_SIZE_NUM     = ${BATCH_SIZE}
+local BATCH_INTERVAL_NUM = ${BATCH_INTERVAL}  -- секунды
+
+-------------------------------------------------------------------------------
+-- RPS‐лимит (запросы в секунду) для одного IP
+-------------------------------------------------------------------------------
+local RPS_LIMIT_NUM = ${RPS_LIMIT}
+
+-------------------------------------------------------------------------------
+-- Функция получения отдельного соединения Redis
+-------------------------------------------------------------------------------
+local function get_redis()
+  local red = redis_lib:new()
+  red:set_timeout(REDIS_TIMEOUT)
+  local ok, err = red:connect(REDIS_HOST, REDIS_PORT_NUM)
+  if not ok then
+    safe_log("Redis connect error (main): " .. (err or "nil"))
+    return nil
+  end
+  return red
+end
+
+-------------------------------------------------------------------------------
+-- Функция периодической отправки в ClickHouse
+-------------------------------------------------------------------------------
+local function periodic_flush(premature)
+  if premature then
+    return
+  end
+
+  -- Подключаемся к Redis (для логирования)
+  local red_log = get_redis()
+  if not red_log then
+    return
+  end
+
+  -- Собираем пачку из Redis-списка "request_logs"
+  local batch = {}
+  for i = 1, BATCH_SIZE_NUM do
+    local res, err = red_log:lpop("request_logs")
+    if not res then
+      safe_log("Redis LPOP error: " .. (err or "nil"))
+      break
+    end
+    if res == ngx.null then
+      break
+    end
+    local decoded = cjson.decode(res)
+    if decoded then
+      batch[#batch + 1] = decoded
+    end
+  end
+
+  -- Если пачка пуста, сбрасываем флаг и возвращаем соединение
+  if #batch == 0 then
+    red_log:del("flush_timer_started")
+    red_log:set_keepalive(60000, 100)
+    return
+  end
+
+  -- Формируем HTTP-запрос к ClickHouse
+  local httpc = http_lib.new()
+  httpc:set_timeout(10000)  -- 10 сек
+  local url = "http://" .. CH_HOST .. ":" .. tostring(CH_PORT_NUM)
+
+  -- Собираем тело JSONEachRow
+  local query = "INSERT INTO " .. CH_DATABASE .. "." .. CH_TABLE .. " FORMAT JSONEachRow\n"
+  local body_lines = {}
+  for _, row in ipairs(batch) do
+    body_lines[#body_lines + 1] = cjson.encode(row)
+  end
+  local payload = query .. table.concat(body_lines, "\n")
+
+  local res, err = httpc:request_uri(url, {
+    method = "POST",
+    body = payload,
+    headers = {
+      ["Content-Type"]  = "application/x-www-form-urlencoded",
+      ["Authorization"] = "Basic " .. ngx.encode_base64(CH_USER .. ":" .. CH_PASSWORD),
+    },
+  })
+
+  if not res or res.status ~= 200 then
+    safe_log("ClickHouse insert error: " .. (err or (res and res.status) or "nil"))
+  else
+    safe_log("batch sent, rows: " .. tostring(#batch))
+  end
+
+  httpc:set_keepalive()
+  red_log:set_keepalive(60000, 100)
+end
+
+-------------------------------------------------------------------------------
+-- Функция запуска таймера один раз до следующего сброса
+-------------------------------------------------------------------------------
+local function start_flush_timer_once()
+  local red_timer = get_redis()
+  if not red_timer then
+    return
+  end
+
+  -- Ставим флаг, чтобы не создать несколько таймеров одновременно
+  local ok, err = red_timer:setnx("flush_timer_started", "1")
+  if not ok then
+    -- err == "0" означает, что ключ уже существует (таймер уже запущен)
+    if err ~= "0" and err ~= nil then
+      safe_log("Redis (timer) SETNX error: " .. err)
+    end
+    red_timer:set_keepalive(60000, 100)
+    return
+  end
+
+  -- Вычисляем TTL как целое (чтобы Redis не ругался)
+  local ttl = math.ceil(BATCH_INTERVAL_NUM + 1)  -- например, 1.5 → 2
+  local ok_expire, err_expire = red_timer:expire("flush_timer_started", ttl)
+  if not ok_expire then
+    safe_log("Redis (timer) EXPIRE error: " .. (err_expire or "nil"))
+  end
+
+  red_timer:set_keepalive(60000, 100)
+
+  -- Запускаем периодический flush через BATCH_INTERVAL_NUM
+  local ok_timer, err_timer = ngx.timer.at(BATCH_INTERVAL_NUM, periodic_flush)
+  if not ok_timer then
+    safe_log("failed to start timer: " .. (err_timer or "nil"))
+  end
+end
+
+-------------------------------------------------------------------------------
+-- Функция добавляет одну запись лога в Redis-список "request_logs"
+-------------------------------------------------------------------------------
+local function queue_log(entry)
+  local red_queue = get_redis()
+  if not red_queue then
+    return
+  end
+
+  local ok_push, err_push = red_queue:rpush("request_logs", cjson.encode(entry))
+  if not ok_push then
+    safe_log("Log error: " .. (err_push or "nil"))
+    red_queue:set_keepalive(60000, 100)
+    return
+  end
+
+  red_queue:set_keepalive(60000, 100)
+  -- Пытаемся запустить таймер, если он не запущен
+  start_flush_timer_once()
+end
+
+-------------------------------------------------------------------------------
+-- 1) Проверка blacklist / whitelist из Redis
+-------------------------------------------------------------------------------
+local redis_main = redis_lib:new()
+redis_main:set_timeout(REDIS_TIMEOUT)
+local ok_main, err_main = redis_main:connect(REDIS_HOST, REDIS_PORT_NUM)
+if not ok_main then
+  safe_log("Redis connect error (main): " .. (err_main or "nil"))
+  return
+end
+
+local ip   = ngx.var.http_x_real_ip or ngx.var.http_x_forwarded_for or ngx.var.remote_addr
+local host = ngx.var.host or "unknown"
+local uri  = ngx.var.request_uri or ""
+local method = ngx.req.get_method() or "GET"
+
+-- Получаем все значения из hash "ip_rules"
+local rules_raw, errRules = redis_main:hvals("ip_rules")
+if not rules_raw then
+  safe_log("Failed to get ip_rules: " .. (errRules or "nil"))
+  redis_main:set_keepalive(60000, 100)
+  return
+end
+
+-- Определяем домен по host
+local domain
+if host:match("^dev%.") then
+  domain = "dev"
+elseif host:match("^test%.") then
+  domain = "test"
+else
+  domain = "production"
+end
+
+local matched = nil
+for _, raw in ipairs(rules_raw) do
+  local ok_decode, rule = pcall(cjson.decode, raw)
+  if ok_decode and rule.ip == ip and rule.domain == domain then
+    matched = rule
+    break
+  end
+end
+
+-- Если есть правило с status = "blacklist" → блокируем
+if matched and matched.status == "blacklist" then
+  redis_main:set_keepalive(60000, 100)
+  return ngx.exit(ngx.HTTP_FORBIDDEN)
+end
+
+-- Если есть правило с status = "whitelist" → разрешаем без дальнейших проверок
+if matched and matched.status == "whitelist" then
+  redis_main:set_keepalive(60000, 100)
+  -- Всё равно логируем запрос
+  local entry = {
+    request_id = tostring(math.floor(ngx.now() * 1000)) .. "-" .. tostring(math.random(1000000, 9999999)),
+    user       = "",
+    ip         = ip,
+    host       = host,
+    uri        = uri,
+    method     = method,
+    args       = ngx.var.args or "",
+    body       = nil,
+    time       = os.date("%Y-%m-%d %H:%M:%S", ngx.time()),
+  }
+  queue_log(entry)
+  return
+end
+
+-------------------------------------------------------------------------------
+-- 2) RPS‐контроль (лимит RPS_LIMIT запросов в секунду с одного IP)
+-------------------------------------------------------------------------------
+local now_ts = os.time()
+local rps_key = string.format("rps:%s:%s:%d", host, ip, now_ts)
+
+local count, cerr = redis_main:incr(rps_key)
+if count == 1 then
+  redis_main:expire(rps_key, 1)
+end
+if not count then
+  safe_log("RPS error: " .. (cerr or "nil"))
+  redis_main:set_keepalive(60000, 100)
+  return
+end
+if count > RPS_LIMIT_NUM then
+  redis_main:set_keepalive(60000, 100)
+  ngx.exit(429)
+  return
+end
+
+redis_main:set_keepalive(60000, 100)
+
+-------------------------------------------------------------------------------
+-- 3) Сбор данных запроса
+-------------------------------------------------------------------------------
+if method == "OPTIONS" then
+  return
+end
+
+-- Пропуск статики по расширениям и путям
+local static_patterns = {
+  "%.css$", "%.js$", "%.png$", "%.jpg$", "%.jpeg$", "%.svg$",
+  "%.woff$", "%.woff2$", "%.ttf$", "%.ico$", "%.map$",
+  "^/favicon.ico$", "^/robots.txt$", "^/static/"
+}
+for _, p in ipairs(static_patterns) do
+  if uri:match(p) then
+    return
+  end
+end
+
+ngx.req.read_body()
+local body = ngx.req.get_body_data()
+
+if method == "POST" and (uri:find("/login", 1, true) or uri:find("/auth", 1, true)) then
+  body = nil
+end
+
+local function decode_jwt_payload(token)
+  if not token then return nil end
+  local parts = {}
+  for part in token:gmatch("[^%.]+") do table.insert(parts, part) end
+  if #parts < 2 then return nil end
+  local b64 = parts[2]
+  local rem = #b64 % 4
+  if rem > 0 then b64 = b64 .. string.rep("=", 4 - rem) end
+  local json = ngx.decode_base64(b64)
+  if not json then return nil end
+  local ok2, tbl = pcall(cjson.decode, json)
+  if ok2 then return tbl end
+  return nil
+end
+
+local headers = ngx.req.get_headers()
+local token   = headers["authorization"] or headers["Authorization"]
+local payload = decode_jwt_payload(token)
+local user_sub = payload and payload.sub or ""
+
+local function generate_request_id()
+  local millis = tostring(math.floor(ngx.now() * 1000))
+  local rand   = tostring(math.random(1000000, 9999999))
+  return millis .. "-" .. rand
+end
+local request_id = generate_request_id()
+
+local formatted_time = os.date("%Y-%m-%d %H:%M:%S", ngx.time())
+
+local entry = {
+  request_id = request_id,
+  user       = user_sub,
+  ip         = ip,
+  host       = host,
+  uri        = uri,
+  method     = method,
+  args       = ngx.var.args or "",
+  body       = body,
+  time       = formatted_time,
+}
+
+-------------------------------------------------------------------------------
+-- 4) Отправка записи в Redis-список для последующей пакетной отправки
+-------------------------------------------------------------------------------
+queue_log(entry)
+
+return
