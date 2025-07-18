@@ -443,55 +443,84 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -d "$SCRIPT_DIR/nginx-reverse" ]; then
     log_step "Настройка Nginx reverse proxy"
     log_cmd "Копирование nginx-reverse в /opt/$PROJECT_NAME"
+    
+    # Очищаем директорию если она не пустая
+    if [ "$(ls -A /opt/$PROJECT_NAME 2>/dev/null)" ]; then
+        log_cmd "Очистка существующих файлов в /opt/$PROJECT_NAME"
+        rm -rf "/opt/$PROJECT_NAME/"*
+    fi
+    
+    # Копируем файлы
     cp -r "$SCRIPT_DIR/nginx-reverse/"* "/opt/$PROJECT_NAME/"
     chown -R $REAL_USER:$REAL_USER "/opt/$PROJECT_NAME"
     
-    # Обновляем docker-compose.yml с правильными параметрами
-    log_cmd "Обновление конфигурации docker-compose.yml"
+    # Проверяем наличие docker-compose файлов и обновляем их
+    log_cmd "Обновление конфигурации docker-compose"
     cd "/opt/$PROJECT_NAME"
     
-    # Создаем временный файл с обновленной конфигурацией
-    sed -e "s|BACKEND_HOST=.*|BACKEND_HOST=$BACKEND_HOST|" \
-        -e "s|BACKEND_PORT=.*|BACKEND_PORT=$BACKEND_PORT|" \
-        -e "s|BACKEND_SCHEME=.*|BACKEND_SCHEME=$BACKEND_SCHEME|" \
-        -e "s|BACKEND_SSL_NAME=.*|BACKEND_SSL_NAME=$DOMAIN|" \
-        -e "s|/etc/letsencrypt/live/[^/]*/|/etc/letsencrypt/live/$DOMAIN/|g" \
-        docker-compose.yml > docker-compose.yml.tmp && mv docker-compose.yml.tmp docker-compose.yml
+    # Ищем файл docker-compose
+    COMPOSE_FILE=""
+    if [ -f "docker-compose.yml" ]; then
+        COMPOSE_FILE="docker-compose.yml"
+    elif [ -f "docker-compose.yaml" ]; then
+        COMPOSE_FILE="docker-compose.yaml"
+    else
+        log_error "Файл docker-compose.yml или docker-compose.yaml не найден в nginx-reverse"
+        log_warning "Пропускаем настройку reverse proxy"
+    fi
     
-    log_cmd "Запуск $PROJECT_NAME start..."
-    sudo -u $REAL_USER bash -c "cd /opt/$PROJECT_NAME && docker compose up -d"
-    
-    # Ждем запуска ClickHouse
-    log_cmd "Ожидание запуска ClickHouse..."
-    sleep 10
-    
-    # Создаем базу и таблицу в ClickHouse
-    log_cmd "Создание базы и таблицы в ClickHouse..."
-    docker exec -i clickhouse-server clickhouse-client --query "
-    CREATE DATABASE IF NOT EXISTS logs_db;
+    if [ -n "$COMPOSE_FILE" ]; then
+        # Создаем резервную копию
+        cp "$COMPOSE_FILE" "$COMPOSE_FILE.backup"
+        
+        # Обновляем конфигурацию
+        sed -e "s|BACKEND_HOST=.*|BACKEND_HOST=$BACKEND_HOST|" \
+            -e "s|BACKEND_PORT=.*|BACKEND_PORT=$BACKEND_PORT|" \
+            -e "s|BACKEND_SCHEME=.*|BACKEND_SCHEME=$BACKEND_SCHEME|" \
+            -e "s|BACKEND_SSL_NAME=.*|BACKEND_SSL_NAME=$DOMAIN|" \
+            -e "s|/etc/letsencrypt/live/[^/]*/|/etc/letsencrypt/live/$DOMAIN/|g" \
+            "$COMPOSE_FILE" > "$COMPOSE_FILE.tmp" && mv "$COMPOSE_FILE.tmp" "$COMPOSE_FILE"
+        
+        log_cmd "Запуск $PROJECT_NAME start..."
+        if sudo -u $REAL_USER bash -c "cd /opt/$PROJECT_NAME && docker compose up -d"; then
+            log_success "Nginx reverse proxy запущен"
+            
+            # Ждем запуска ClickHouse
+            log_cmd "Ожидание запуска ClickHouse..."
+            sleep 10
+            
+            # Создаем базу и таблицу в ClickHouse
+            log_cmd "Создание базы и таблицы в ClickHouse..."
+            if docker exec -i clickhouse-server clickhouse-client --query "
+            CREATE DATABASE IF NOT EXISTS logs_db;
 
-    CREATE TABLE IF NOT EXISTS logs_db.request_logs
-    (
-        request_id String,
-        user String,
-        ip String,
-        host String,
-        uri String,
-        method String,
-        args String,
-        body Nullable(String),
-        time DateTime
-    ) 
-    ENGINE = MergeTree()
-    ORDER BY (time, ip, host)
-    PARTITION BY toYYYYMM(time)
-    TTL time + INTERVAL 30 DAY;
-    " 2>/dev/null || {
-        log_warning "Не удалось создать таблицу ClickHouse сейчас, попробуйте позже:"
-        log_info "docker exec -i clickhouse-server clickhouse-client --query \"CREATE DATABASE IF NOT EXISTS logs_db; CREATE TABLE IF NOT EXISTS logs_db.request_logs ...\""
-    }
-    
-    log_success "Nginx reverse proxy настроен и запущен"
+            CREATE TABLE IF NOT EXISTS logs_db.request_logs
+            (
+                request_id String,
+                user String,
+                ip String,
+                host String,
+                uri String,
+                method String,
+                args String,
+                body Nullable(String),
+                time DateTime
+            ) 
+            ENGINE = MergeTree()
+            ORDER BY (time, ip, host)
+            PARTITION BY toYYYYMM(time)
+            TTL time + INTERVAL 30 DAY;
+            " 2>/dev/null; then
+                log_success "ClickHouse база и таблица созданы"
+            else
+                log_warning "Не удалось создать таблицу ClickHouse сейчас, попробуйте позже командой:"
+                log_info "$PROJECT_NAME-db create-table"
+            fi
+        else
+            log_error "Не удалось запустить nginx reverse proxy"
+            log_warning "Проверьте логи: docker compose logs -f"
+        fi
+    fi
 else
     log_warning "Директория nginx-reverse не найдена рядом со скриптом"
 fi
@@ -500,42 +529,71 @@ fi
 if [ -d "$SCRIPT_DIR/nginx-api" ]; then
     log_step "Настройка API проекта"
     log_cmd "Копирование nginx-api в /opt/$PROJECT_NAME-api"
+    
+    # Очищаем директорию если она не пустая (кроме node_modules и dist)
+    if [ "$(ls -A /opt/$PROJECT_NAME-api 2>/dev/null)" ]; then
+        log_cmd "Очистка существующих файлов в /opt/$PROJECT_NAME-api (сохраняем node_modules и dist)"
+        find "/opt/$PROJECT_NAME-api" -mindepth 1 -maxdepth 1 ! -name 'node_modules' ! -name 'dist' ! -name '.yarn' -exec rm -rf {} + 2>/dev/null || true
+    fi
+    
+    # Копируем файлы
     cp -r "$SCRIPT_DIR/nginx-api/"* "/opt/$PROJECT_NAME-api/"
     chown -R $REAL_USER:$REAL_USER "/opt/$PROJECT_NAME-api"
     
+    # Устанавливаем зависимости с обработкой ошибок
     log_cmd "Установка зависимостей..."
-    sudo -u $REAL_USER bash -c "
+    if sudo -u $REAL_USER bash -c "
     export NVM_DIR=\"$REAL_HOME/.nvm\"
     [ -s \"\$NVM_DIR/nvm.sh\" ] && \. \"\$NVM_DIR/nvm.sh\"
     cd /opt/$PROJECT_NAME-api
     yarn install
-    "
-    
-    log_cmd "Сборка проекта..."
-    sudo -u $REAL_USER bash -c "
-    export NVM_DIR=\"$REAL_HOME/.nvm\"
-    [ -s \"\$NVM_DIR/nvm.sh\" ] && \. \"\$NVM_DIR/nvm.sh\"
-    cd /opt/$PROJECT_NAME-api
-    yarn build
-    "
-    
-    log_cmd "Запуск API через PM2..."
-    sudo -u $REAL_USER bash -c "
-    export NVM_DIR=\"$REAL_HOME/.nvm\"
-    [ -s \"\$NVM_DIR/nvm.sh\" ] && \. \"\$NVM_DIR/nvm.sh\"
-    cd /opt/$PROJECT_NAME-api
-    pm2 start ecosystem.config.js || pm2 start --name $PROJECT_NAME-api yarn -- start --host 127.0.0.1 --port 15000
-    pm2 save
-    "
-    
-    # Настраиваем автозапуск PM2
-    sudo -u $REAL_USER bash -c "
-    export NVM_DIR=\"$REAL_HOME/.nvm\"
-    [ -s \"\$NVM_DIR/nvm.sh\" ] && \. \"\$NVM_DIR/nvm.sh\"
-    pm2 startup
-    "
-    
-    log_success "API проект настроен и запущен на 127.0.0.1:15000"
+    " 2>/dev/null; then
+        log_success "Зависимости установлены"
+        
+        # Сборка проекта с обработкой ошибок
+        log_cmd "Сборка проекта..."
+        if sudo -u $REAL_USER bash -c "
+        export NVM_DIR=\"$REAL_HOME/.nvm\"
+        [ -s \"\$NVM_DIR/nvm.sh\" ] && \. \"\$NVM_DIR/nvm.sh\"
+        cd /opt/$PROJECT_NAME-api
+        yarn build
+        " 2>/dev/null; then
+            log_success "Проект собран"
+            
+            # Запуск API через PM2 с обработкой ошибок
+            log_cmd "Запуск API через PM2..."
+            if sudo -u $REAL_USER bash -c "
+            export NVM_DIR=\"$REAL_HOME/.nvm\"
+            [ -s \"\$NVM_DIR/nvm.sh\" ] && \. \"\$NVM_DIR/nvm.sh\"
+            cd /opt/$PROJECT_NAME-api
+            pm2 start ecosystem.config.js 2>/dev/null || pm2 start --name $PROJECT_NAME-api yarn -- start --host 127.0.0.1 --port 15000
+            pm2 save
+            " 2>/dev/null; then
+                log_success "API запущен через PM2"
+                
+                # Настраиваем автозапуск PM2
+                sudo -u $REAL_USER bash -c "
+                export NVM_DIR=\"$REAL_HOME/.nvm\"
+                [ -s \"\$NVM_DIR/nvm.sh\" ] && \. \"\$NVM_DIR/nvm.sh\"
+                pm2 startup
+                " 2>/dev/null || log_warning "Не удалось настроить автозапуск PM2"
+                
+                log_success "API проект настроен и запущен на 127.0.0.1:15000"
+            else
+                log_error "Не удалось запустить API через PM2"
+                log_warning "API сервис не критичен, продолжаем установку"
+                log_info "Можете запустить API позже командой: $PROJECT_NAME-api start"
+            fi
+        else
+            log_error "Ошибка при сборке API проекта"
+            log_warning "API сервис не критичен, продолжаем установку"
+            log_info "Проверьте код в /opt/$PROJECT_NAME-api и соберите вручную: $PROJECT_NAME-api build"
+        fi
+    else
+        log_error "Ошибка при установке зависимостей API"
+        log_warning "API сервис не критичен, продолжаем установку"
+        log_info "Проверьте package.json в /opt/$PROJECT_NAME-api"
+    fi
 else
     log_warning "Директория nginx-api не найдена рядом со скриптом"
 fi
@@ -627,9 +685,25 @@ log_success "NVM, Node.js $TARGET_NODE_VERSION, PM2 и Yarn установлен
 log_success "Certbot установлен"
 log_success "SSL сертификат получен для $DOMAIN"
 log_success "Файрвол настроен"
-log_success "Nginx reverse proxy настроен и запущен"
-log_success "API проект настроен и запущен на 127.0.0.1:15000"
-log_success "ClickHouse настроен с базой logs_db"
+
+# Проверяем статус компонентов
+if [ -d "/opt/$PROJECT_NAME" ] && [ -n "$(docker ps -q)" ]; then
+    log_success "Nginx reverse proxy настроен и запущен"
+else
+    log_warning "Nginx reverse proxy настроен, но возможны проблемы с запуском"
+fi
+
+if pgrep -f "$PROJECT_NAME-api" > /dev/null 2>&1; then
+    log_success "API проект настроен и запущен на 127.0.0.1:15000"
+else
+    log_warning "API проект настроен, но не запущен (не критично)"
+fi
+
+if docker ps | grep -q clickhouse; then
+    log_success "ClickHouse настроен с базой logs_db"
+else
+    log_warning "ClickHouse настроен, но возможны проблемы с подключением"
+fi
 
 echo
 echo -e "${CYAN}🔧 Полезные команды:${NC}"
@@ -668,6 +742,14 @@ else
 fi
 echo -e "  ${BLUE}2.${NC} API доступен на ${CYAN}http://127.0.0.1:15000${NC}"
 echo -e "  ${BLUE}3.${NC} ClickHouse веб-интерфейс: ${CYAN}http://$(curl -s ifconfig.me):8123/play${NC}"
+
+echo
+echo -e "${CYAN}🚨 Диагностика проблем:${NC}"
+echo -e "  ${BLUE}Проверить статус контейнеров:${NC} docker ps"
+echo -e "  ${BLUE}Проверить логи nginx:${NC} $PROJECT_NAME logs nginx"
+echo -e "  ${BLUE}Проверить логи API:${NC} $PROJECT_NAME-api logs"
+echo -e "  ${BLUE}Проверить процессы PM2:${NC} $PROJECT_NAME-api status"
+echo -e "  ${BLUE}Пересобрать API:${NC} $PROJECT_NAME-api build && $PROJECT_NAME-api restart"
 
 echo
 log_warning "Перелогиньтесь для применения группы docker"
